@@ -1,27 +1,30 @@
-"""بازارچه امن آیدی سروش‌پلاس — بات + API (دیتابیس: Turso روی HTTP)
-pip install aiohttp
+"""بازارچه امن آیدی سروش‌پلاس — بات + API (دیتابیس: Turso با پکیج turso_serverless)
+pip install aiohttp turso-serverless
 ENV: BOT_TOKEN, ADMIN_ID, CARD, TURSO_URL, TURSO_TOKEN
      [LOCK_HOURS=12] [FEE_PERCENT=5] [NEW_SELLER_MAX=2000000] [PORT=8080] [FRAME_ANCESTORS=https://*.splus.ir]
 """
-import os, time, json, hmac, hashlib, random, re, asyncio, logging
+import os, time, json, hmac, hashlib, random, re, asyncio, logging, threading, functools
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qsl
 import aiohttp
 from aiohttp import web
+import turso_serverless
 
 TOKEN = os.environ["BOT_TOKEN"]
-ADMIN = int(os.environ.get("ADMIN_ID", "0"))
+ADMIN = int(os.environ["ADMIN_ID"])
 CARD = os.environ.get("CARD", "")
 LOCK_H = float(os.environ.get("LOCK_HOURS", "12"))
 FEE = float(os.environ.get("FEE_PERCENT", "5"))
 NEW_MAX = int(os.environ.get("NEW_SELLER_MAX", "2000000"))
 FRAME = os.environ.get("FRAME_ANCESTORS", "https://*.splus.ir")
-TURSO_URL = os.environ["TURSO_URL"].strip().replace("libsql://", "https://", 1).rstrip("/")
+TURSO_URL = os.environ["TURSO_URL"].strip().rstrip("/")  # همان فرمت libsql://... که در bot-9.py کار می‌کند
 TURSO_TOKEN = os.environ["TURSO_TOKEN"].strip()
 API = f"https://api.splus.ir/bot{TOKEN}/"
 log = logging.getLogger("market")
 BOT_USER = ""
 SES = None
+EXPLICIT_TX = False  # اگر درایور autocommit باشد، در استارت‌آپ True می‌شود و BEGIN/COMMIT دستی می‌زنیم
 
 SCHEMA = [
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, name TEXT, done INTEGER DEFAULT 0)",
@@ -31,38 +34,51 @@ SCHEMA = [
        price INTEGER, descr TEXT, status TEXT DEFAULT 'active', ts REAL)""",
     """CREATE TABLE IF NOT EXISTS deals(id INTEGER PRIMARY KEY AUTOINCREMENT, lid INTEGER, buyer INTEGER, seller INTEGER,
        uname TEXT, price INTEGER, status TEXT, lock REAL, ts REAL)""",
+    "CREATE INDEX IF NOT EXISTS ix_listings_status ON listings(status, id)",
+    "CREATE INDEX IF NOT EXISTS ix_listings_uname ON listings(uname, status)",
+    "CREATE INDEX IF NOT EXISTS ix_deals_buyer ON deals(buyer, status)",
+    "CREATE INDEX IF NOT EXISTS ix_deals_seller ON deals(seller)",
+    "CREATE INDEX IF NOT EXISTS ix_deals_status ON deals(status, lock)",
 ]
 
 
-# ---------- Turso (HTTP / pipeline API) ----------
-def _arg(v):
-    if v is None:
-        return {"type": "null"}
-    if isinstance(v, (bool, int)):
-        return {"type": "integer", "value": str(int(v))}
-    if isinstance(v, float):
-        return {"type": "float", "value": v}
-    return {"type": "text", "value": str(v)}
+class Err(Exception):
+    pass
 
 
-def _val(c):
-    t, v = c.get("type"), c.get("value")
-    if t == "null":
-        return None
-    if t == "integer":
-        return int(v)
-    if t == "float":
-        return float(v)
-    return v
+# ---------- Turso (turso_serverless) ----------
+# هر ترد اتصال مخصوص خودش را دارد (روی اتصال HTTP/stream اشتراک بین تردها نتیجه‌ها را قاطی می‌کند).
+# فراخوانی‌ها در ترد جدا اجرا می‌شوند تا حلقه‌ی asyncio بلاک نشود.
+_loc = threading.local()
+_STALE = ("stream not found", "stream_expired", "stream expired", "baton")
+
+
+def _conn():
+    c = getattr(_loc, "conn", None)
+    if c is None:
+        c = turso_serverless.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+        _loc.conn = c
+    return c
+
+
+def _reset():
+    c = getattr(_loc, "conn", None)
+    _loc.conn = None
+    try:
+        if c is not None:
+            c.close()
+    except Exception:
+        pass
+
+
+def _stale(e):
+    m = str(e).lower()
+    return any(s in m for s in _STALE) or ("404" in m and "stream" in m)
 
 
 class Res:
-    def __init__(self, r):
-        cols = [c["name"] for c in r.get("cols", [])]
-        self.rows = [dict(zip(cols, map(_val, row))) for row in r.get("rows", [])]
-        self.rowcount = r.get("affected_row_count", 0)
-        lid = r.get("last_insert_rowid")
-        self.lastrowid = int(lid) if lid is not None else None
+    def __init__(self, rows, rowcount, lastrowid):
+        self.rows, self.rowcount, self.lastrowid = rows, rowcount, lastrowid
 
     def fetchone(self):
         return self.rows[0] if self.rows else None
@@ -71,29 +87,100 @@ class Res:
         return self.rows
 
 
-async def q(sql, *a):
-    body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [_arg(x) for x in a]}}, {"type": "close"}]}
-    for attempt in (1, 2):
+def _cn(c):
+    return str(c[0]) if isinstance(c, (tuple, list)) else str(getattr(c, "name", c))
+
+
+def _res(cur):
+    d = cur.description
+    cols = [_cn(c) for c in d] if d else []
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()] if cols else []
+    rc = cur.rowcount
+    return Res(rows, rc if isinstance(rc, int) and rc > 0 else 0, getattr(cur, "lastrowid", None))
+
+
+class T:
+    """یک اتصال + یک تراکنش. فقط داخل ترد دیتابیس (از طریق run) استفاده شود."""
+
+    def __init__(self, conn):
+        self.conn, self.began, self.dirty = conn, False, False
+
+    def q(self, sql, *a):
+        write = sql.lstrip()[:6].lower() != "select"
+        cur = self.conn.cursor()
+        if write and EXPLICIT_TX and not self.began:
+            cur.execute("BEGIN")
+            self.began = True
+        if write:
+            self.dirty = True
+        if a:
+            cur.execute(sql, a)
+        else:
+            cur.execute(sql)
+        return _res(cur)
+
+    def finish(self):
+        if not self.dirty:
+            return
+        if EXPLICIT_TX:
+            self.conn.cursor().execute("COMMIT")
+        else:
+            self.conn.commit()
+
+    def abort(self):
         try:
-            async with SES.post(TURSO_URL + "/v2/pipeline", json=body,
-                                headers={"Authorization": "Bearer " + TURSO_TOKEN},
-                                timeout=aiohttp.ClientTimeout(total=20)) as r:
-                j = await r.json(content_type=None)
-                if r.status != 200:
-                    raise RuntimeError(f"turso http {r.status}: {j}")
-            break
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            if attempt == 2:
-                raise
-            await asyncio.sleep(0.3)
-    res = j["results"][0]
-    if res["type"] == "error":
-        raise RuntimeError("turso: " + res["error"]["message"])
-    return Res(res["response"]["result"])
+            if EXPLICIT_TX:
+                if self.began:
+                    self.conn.cursor().execute("ROLLBACK")
+            elif self.dirty:
+                self.conn.rollback()
+        except Exception:
+            pass
 
 
-class Err(Exception):
-    pass
+def _run(fn, idem):
+    for attempt in (1, 2):
+        t = T(_conn())
+        try:
+            r = fn(t)
+            t.finish()
+            return r
+        except Exception as e:
+            t.abort()
+            # فقط وقتی تکرار امن است: stream منقضی‌شده (دستور اجرا نشده) یا عملیات خواندنی.
+            # نوشتنِ نیمه‌کاره بعد از تایم‌اوت هرگز خودکار تکرار نمی‌شود (رکورد تکراری نسازد).
+            if attempt == 1 and (_stale(e) or idem):
+                log.warning("db retry after: %s", e)
+                _reset()
+                continue
+            raise
+
+
+async def run(fn, idem=False):
+    """fn(t) را در یک تراکنش اتمیک اجرا می‌کند؛ هر خطا (از جمله Err) = rollback کامل."""
+    return await asyncio.to_thread(_run, fn, idem)
+
+
+async def q(sql, *a):
+    return await run(lambda t: t.q(sql, *a), idem=sql.lstrip()[:6].lower() == "select")
+
+
+def _probe_autocommit():
+    """آیا conn.rollback() واقعاً کار می‌کند؟ اگر نه، درایور autocommit است و باید BEGIN/COMMIT دستی بزنیم."""
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS _probe(x INTEGER)")
+    conn.commit()
+    cur.execute("DELETE FROM _probe")
+    conn.commit()
+    cur.execute("INSERT INTO _probe VALUES(1)")
+    conn.rollback()
+    cur.execute("SELECT COUNT(*) AS n FROM _probe")
+    row = cur.fetchall()[0]
+    n = row[0]
+    cur.execute("DELETE FROM _probe")
+    conn.commit()
+    return n != 0  # True = autocommit
 
 
 # ---------- Soroush Plus bot API ----------
@@ -138,17 +225,29 @@ def check_init(raw):
     return None
 
 
+_seen = {}  # کش کاربران دیده‌شده؛ تا هر درخواست یک نوشتن اضافه روی دیتابیس راه دور نزند
+
+
 def api(fn):
+    @functools.wraps(fn)
     async def w(req):
         u = check_init(req.headers.get("X-Init", ""))
         if not u:
             return web.json_response({"error": "احراز هویت ناموفق؛ برنامک را از داخل سروش‌پلاس باز کنید"}, status=401)
-        await q("INSERT INTO users(id,username,name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,name=excluded.name",
-                u["id"], (u.get("username") or "").lower(), u.get("first_name", ""))
         try:
+            key = ((u.get("username") or "").lower(), u.get("first_name", ""))
+            if _seen.get(u["id"]) != key:
+                await q("INSERT INTO users(id,username,name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,name=excluded.name",
+                        u["id"], key[0], key[1])
+                if len(_seen) > 50000:
+                    _seen.clear()
+                _seen[u["id"]] = key
             return web.json_response(await fn(req, u))
         except Err as e:
             return web.json_response({"error": str(e)}, status=400)
+        except Exception:
+            log.exception("api %s", fn.__name__)
+            return web.json_response({"error": "خطای موقت سرور؛ چند لحظه بعد دوباره تلاش کنید"}, status=500)
     return w
 
 
@@ -181,7 +280,7 @@ async def verify_start(req, u):
     me = (await q("SELECT done FROM users WHERE id=?", u["id"])).fetchone()
     if ((me or {}).get("done") or 0) == 0 and price > NEW_MAX:
         raise Err(f"فروشنده‌های جدید تا سقف {NEW_MAX:,} تومان می‌توانند آگهی بدهند")
-    if (await q("SELECT 1 FROM listings WHERE uname=? AND status IN('active','reserved')", un)).fetchone():
+    if (await q("SELECT 1 AS x FROM listings WHERE uname=? AND status IN('active','reserved')", un)).fetchone():
         raise Err("این آیدی همین الان آگهی فعال دارد")
     code = f"{random.SystemRandom().randrange(1000, 10000)}"
     await q("REPLACE INTO pending(uid,uname,code,price,descr,exp,tries,state,why) VALUES(?,?,?,?,?,?,0,'wait','')",
@@ -196,7 +295,7 @@ async def verify_status(req, u):
         return {"state": "none"}
     st = p["state"]
     if st == "wait" and time.time() > p["exp"]:
-        await q("UPDATE pending SET state='expired' WHERE uid=?", u["id"])
+        await q("UPDATE pending SET state='expired' WHERE uid=? AND state='wait'", u["id"])
         st = "expired"
     return {"state": st, "why": p["why"], "left": max(0, int(p["exp"] - time.time())), "tries": 3 - p["tries"]}
 
@@ -220,12 +319,13 @@ async def deals_new(req, u):
         raise Err("آگهی خودتان را نمی‌توانید بخرید")
     if (await q("SELECT COUNT(*) c FROM deals WHERE buyer=? AND status='wait_pay'", u["id"])).fetchone()["c"] >= 2:
         raise Err("ابتدا معاملات در انتظار پرداخت قبلی را تعیین تکلیف کنید")
-    # رزرو اتمیک: اگر دو نفر همزمان بزنند فقط یکی موفق می‌شود
-    if not (await q("UPDATE listings SET status='reserved' WHERE id=? AND status='active'", lid)).rowcount:
-        raise Err("این آگهی دیگر موجود نیست")
-    cur = await q("INSERT INTO deals(lid,buyer,seller,uname,price,status,ts) VALUES(?,?,?,?,?,'wait_pay',?)",
-                  lid, u["id"], l["seller"], l["uname"], l["price"], time.time())
-    return {"id": cur.lastrowid}
+
+    def tx(t):  # رزرو + ساخت معامله در یک تراکنش: یا هر دو، یا هیچ‌کدام
+        if not t.q("UPDATE listings SET status='reserved' WHERE id=? AND status='active'", lid).rowcount:
+            raise Err("این آگهی دیگر موجود نیست")
+        return t.q("INSERT INTO deals(lid,buyer,seller,uname,price,status,ts) VALUES(?,?,?,?,?,'wait_pay',?)",
+                   lid, u["id"], l["seller"], l["uname"], l["price"], time.time()).lastrowid
+    return {"id": await run(tx)}
 
 
 @api
@@ -242,6 +342,16 @@ async def deal_get(req, u):
     return dview(d, u["id"])
 
 
+async def cancel_deal(did, lid):
+    """لغو معامله‌ی در انتظار پرداخت + آزادکردن آگهی (اتمیک). True اگر واقعاً لغو شد."""
+    def tx(t):
+        if not t.q("UPDATE deals SET status='cancel' WHERE id=? AND status='wait_pay'", did).rowcount:
+            return False
+        t.q("UPDATE listings SET status='active' WHERE id=?", lid)
+        return True
+    return await run(tx)
+
+
 @api
 async def deal_act(req, u):
     did, act = int(req.match_info["id"]), (await req.json()).get("act")
@@ -250,8 +360,7 @@ async def deal_act(req, u):
         raise Err("معامله پیدا نشد")
     buyer, seller, st = d["buyer"] == u["id"], d["seller"] == u["id"], d["status"]
     if act == "cancel" and buyer and st == "wait_pay":
-        if (await q("UPDATE deals SET status='cancel' WHERE id=? AND status='wait_pay'", did)).rowcount:
-            await q("UPDATE listings SET status='active' WHERE id=?", d["lid"])
+        await cancel_deal(did, d["lid"])
     elif act == "handed" and seller and st == "paid":
         if (await q("UPDATE deals SET status='handed',lock=? WHERE id=? AND status='paid'", time.time() + LOCK_H * 3600, did)).rowcount:
             await say(d["buyer"], f"فروشنده آیدی @{d['uname']} را تحویل داد.\nتا {LOCK_H:g} ساعت فرصت دارید تأیید یا شکایت کنید (از داخل برنامک).")
@@ -305,8 +414,12 @@ async def on_message(m):
             await q("UPDATE pending SET state='fail',why='آیدی واردشده متعلق به این اکانت نیست' WHERE uid=?", uid)
             return await say(uid, "❌ آیدی واردشده با اکانت شما یکی نیست.")
         if hmac.compare_digest(txt, p["code"]):
-            if (await q("UPDATE pending SET state='ok' WHERE uid=? AND state='wait'", uid)).rowcount:
-                await q("INSERT INTO listings(seller,uname,price,descr,ts) VALUES(?,?,?,?,?)", uid, p["uname"], p["price"], p["descr"], time.time())
+            def tx(t):  # تأیید کد + ثبت آگهی در یک تراکنش
+                if not t.q("UPDATE pending SET state='ok' WHERE uid=? AND state='wait'", uid).rowcount:
+                    return False
+                t.q("INSERT INTO listings(seller,uname,price,descr,ts) VALUES(?,?,?,?,?)", uid, p["uname"], p["price"], p["descr"], time.time())
+                return True
+            if await run(tx):
                 return await say(uid, f"✅ مالکیت @{p['uname']} تأیید و آگهی ثبت شد.")
             return
         t = p["tries"] + 1
@@ -318,7 +431,10 @@ async def on_message(m):
 
 
 async def on_callback(c):
-    await call(SES, "answerCallbackQuery", callback_query_id=c["id"])
+    try:
+        await call(SES, "answerCallbackQuery", callback_query_id=c["id"])
+    except Exception as e:
+        log.warning("answerCallback: %s", e)
     if c["from"]["id"] != ADMIN or not c.get("data"):
         return
     act, did = c["data"].split(":")
@@ -331,18 +447,25 @@ async def on_callback(c):
             await say(d["buyer"], f"پرداخت معامله #{did} تأیید شد؛ منتظر تحویل آیدی از فروشنده باشید.")
             await say(d["seller"], f"خریدار پرداخت کرد ✅ آیدی @{d['uname']} را به خریدار تحویل دهید و سپس در برنامک «تحویل دادم» را بزنید.")
     elif act == "no":
-        if (await q("UPDATE deals SET status='cancel' WHERE id=? AND status='wait_pay'", did)).rowcount:
-            await q("UPDATE listings SET status='active' WHERE id=?", d["lid"])
+        if await cancel_deal(did, d["lid"]):
             await say(d["buyer"], f"رسید معامله #{did} تأیید نشد.")
     elif act == "pay":
-        if (await q("UPDATE deals SET status='done' WHERE id=? AND status IN('due','dispute')", did)).rowcount:
-            await q("UPDATE listings SET status='sold' WHERE id=?", d["lid"])
-            await q("UPDATE users SET done=done+1 WHERE id=?", d["seller"])
+        def tx(t):  # بستن معامله + فروخته‌شدن آگهی + شمارنده‌ی فروشنده: اتمیک
+            if not t.q("UPDATE deals SET status='done' WHERE id=? AND status IN('due','dispute')", did).rowcount:
+                return False
+            t.q("UPDATE listings SET status='sold' WHERE id=?", d["lid"])
+            t.q("UPDATE users SET done=done+1 WHERE id=?", d["seller"])
+            return True
+        if await run(tx):
             await say(d["seller"], f"✅ مبلغ معامله #{did} واریز شد.")
             await say(d["buyer"], f"معامله #{did} با موفقیت بسته شد.")
     elif act == "ref":
-        if (await q("UPDATE deals SET status='cancel' WHERE id=? AND status='dispute'", did)).rowcount:
-            await q("UPDATE listings SET status='cancel' WHERE id=?", d["lid"])
+        def tx(t):
+            if not t.q("UPDATE deals SET status='cancel' WHERE id=? AND status='dispute'", did).rowcount:
+                return False
+            t.q("UPDATE listings SET status='cancel' WHERE id=?", d["lid"])
+            return True
+        if await run(tx):
             await say(d["buyer"], f"وجه معامله #{did} به شما بازگردانده می‌شود.")
 
 
@@ -385,10 +508,21 @@ async def health(req):
 
 
 async def lifespan(app):
-    global SES, BOT_USER
+    global SES, BOT_USER, EXPLICIT_TX
+    pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="db")
+    asyncio.get_running_loop().set_default_executor(pool)
     SES = aiohttp.ClientSession()
     for s in SCHEMA:
         await q(s)
+    chk = (await q("SELECT 1 AS x")).fetchone()
+    if not chk or chk.get("x") != 1:
+        raise RuntimeError("turso_serverless: نام ستون‌ها از cursor.description خوانده نشد؛ نسخه‌ی پکیج را بررسی کنید")
+    try:
+        EXPLICIT_TX = await asyncio.to_thread(_probe_autocommit)
+    except Exception:
+        log.exception("tx probe failed; assuming commit()/rollback() work")
+        EXPLICIT_TX = False
+    log.info("db ok; explicit BEGIN/COMMIT = %s", EXPLICIT_TX)
     BOT_USER = (await call(SES, "getMe")).get("username", "")
     try:
         await call(SES, "deleteWebhook")
@@ -399,6 +533,7 @@ async def lifespan(app):
     for t in tasks:
         t.cancel()
     await SES.close()
+    pool.shutdown(wait=False)
 
 
 def main():
